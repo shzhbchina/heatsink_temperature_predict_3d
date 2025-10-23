@@ -1,0 +1,394 @@
+# /workspace/src/eval_heatsink_fno_pino.py
+"""
+用法:
+python src/eval_heatsink_fno_pino.py \
+  --data dat/gridized_vtk_padded_with_scales.h5 \
+  --ckpt dat/runs/heatsink_fno_pino_learnh/ckpt_final.pt \
+  --out  dat/eval_heatsink_learnh.h5 \
+  --rollout \
+  --save_h
+"""
+import os, json, argparse
+import h5py, numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ====== 数值工具（与训练一致） ======
+def _unpack_deltas(d):
+    if isinstance(d, (tuple, list)):
+        return float(d[0]), float(d[1]), float(d[2])
+    if torch.is_tensor(d):
+        v = d.detach().view(-1)
+        return float(v[0].item()), float(v[1].item()), float(v[2].item())
+    raise TypeError(type(d))
+
+def laplacian_3d(u, dz, dy, dx):
+    pad = (1,1,1,1,1,1)  # (xL,xR,yL,yR,zL,zR)
+    up = F.pad(u, pad, mode='replicate')
+    c  = up[:,:,1:-1,1:-1,1:-1]
+    lap = (up[:,:,2:,1:-1,1:-1] - 2*c + up[:,:,:-2,1:-1,1:-1])/(dz*dz) \
+        + (up[:,:,1:-1,2:,1:-1] - 2*c + up[:,:,1:-1,:-2,1:-1])/(dy*dy) \
+        + (up[:,:,1:-1,1:-1,2:] - 2*c + up[:,:,1:-1,1:-1,:-2])/(dx*dx)
+    return lap  # (B,1,Nz,Ny,Nx)
+
+def one_sided_grad_on_interface_v2(u, Ms, nsurf, dz, dy, dx):
+    """
+    与训练脚本相同：二阶单边优先，退一阶，再平均兜底；仅用“固体侧邻居”。
+    u: (B,1,Nz,Ny,Nx), Ms: (B,1,Nz,Ny,Nx), nsurf: (B,3,Nz,Ny,Nx)
+    返回: gz, gy, gx (B,1,Nz,Ny,Nx)
+    """
+    def neigh_z(t):
+        tm1 = torch.cat([t[:,:, :1, :, :], t[:,:, :-1, :, :]], dim=2)
+        tm2 = torch.cat([t[:,:, :2, :, :], t[:,:, :-2, :, :]], dim=2)
+        tp1 = torch.cat([t[:,:, 1:, :, :], t[:,:, -1:, :, :]], dim=2)
+        tp2 = torch.cat([t[:,:, 2:, :, :], t[:,:, -2:, :, :]], dim=2)
+        return tm1, tm2, tp1, tp2
+    def neigh_y(t):
+        tm1 = torch.cat([t[:,:,:, :1, :], t[:,:,:,:-1, :]], dim=3)
+        tm2 = torch.cat([t[:,:,:, :2, :], t[:,:,:,:-2, :]], dim=3)
+        tp1 = torch.cat([t[:,:,:, 1:, :], t[:,:,:,-1:, :]], dim=3)
+        tp2 = torch.cat([t[:,:,:, 2:, :], t[:,:,:,-2:, :]], dim=3)
+        return tm1, tm2, tp1, tp2
+    def neigh_x(t):
+        tm1 = torch.cat([t[:,:,:,:, :1], t[:,:,:,:, :-1]], dim=4)
+        tm2 = torch.cat([t[:,:,:,:, :2], t[:,:,:,:, :-2]], dim=4)
+        tp1 = torch.cat([t[:,:,:,:, 1:], t[:,:,:,:, -1:]], dim=4)
+        tp2 = torch.cat([t[:,:,:,:, 2:], t[:,:,:,:, -2:]], dim=4)
+        return tm1, tm2, tp1, tp2
+
+    # z 轴
+    u_zm1, u_zm2, u_zp1, u_zp2 = neigh_z(u)
+    Ms_zm1, Ms_zm2, Ms_zp1, Ms_zp2 = neigh_z(Ms)
+    gz_bwd2 = (3*u - 4*u_zm1 + u_zm2)/(2*dz); gz_bwd1 = (u - u_zm1)/dz
+    gz_fwd2 = (-3*u + 4*u_zp1 - u_zp2)/(2*dz); gz_fwd1 = (u_zp1 - u)/dz
+    have_bwd2_z = (Ms_zm1>0.5) & (Ms_zm2>0.5)
+    have_bwd1_z = (Ms_zm1>0.5)
+    have_fwd2_z = (Ms_zp1>0.5) & (Ms_zp2>0.5)
+    have_fwd1_z = (Ms_zp1>0.5)
+    nz = nsurf[:,0:1]; use_bwd_z = (nz>=0)
+    gz = torch.zeros_like(u)
+    gz = torch.where(use_bwd_z & have_bwd2_z, gz_bwd2, gz)
+    gz = torch.where((~use_bwd_z) & have_fwd2_z, gz_fwd2, gz)
+    gz = torch.where(use_bwd_z & (~have_bwd2_z) & have_bwd1_z, gz_bwd1, gz)
+    gz = torch.where((~use_bwd_z) & (~have_fwd2_z) & have_fwd1_z, gz_fwd1, gz)
+    gz_fb = torch.where(have_bwd1_z & have_fwd1_z, 0.5*(gz_bwd1 + gz_fwd1),
+             torch.where(have_bwd1_z, gz_bwd1,
+               torch.where(have_fwd1_z, gz_fwd1, torch.zeros_like(u))))
+    need_fb_z = (use_bwd_z & ~(have_bwd2_z | have_bwd1_z)) | ((~use_bwd_z) & ~(have_fwd2_z | have_fwd1_z))
+    gz = torch.where(need_fb_z, gz_fb, gz)
+
+    # y 轴
+    u_ym1, u_ym2, u_yp1, u_yp2 = neigh_y(u)
+    Ms_ym1, Ms_ym2, Ms_yp1, Ms_yp2 = neigh_y(Ms)
+    gy_bwd2 = (3*u - 4*u_ym1 + u_ym2)/(2*dy); gy_bwd1 = (u - u_ym1)/dy
+    gy_fwd2 = (-3*u + 4*u_yp1 - u_yp2)/(2*dy); gy_fwd1 = (u_yp1 - u)/dy
+    have_bwd2_y = (Ms_ym1>0.5) & (Ms_ym2>0.5)
+    have_bwd1_y = (Ms_ym1>0.5)
+    have_fwd2_y = (Ms_yp1>0.5) & (Ms_yp2>0.5)
+    have_fwd1_y = (Ms_yp1>0.5)
+    ny = nsurf[:,1:2]; use_bwd_y = (ny>=0)
+    gy = torch.zeros_like(u)
+    gy = torch.where(use_bwd_y & have_bwd2_y, gy_bwd2, gy)
+    gy = torch.where((~use_bwd_y) & have_fwd2_y, gy_fwd2, gy)
+    gy = torch.where(use_bwd_y & (~have_bwd2_y) & have_bwd1_y, gy_bwd1, gy)
+    gy = torch.where((~use_bwd_y) & (~have_fwd2_y) & have_fwd1_y, gy_fwd1, gy)
+    gy_fb = torch.where(have_bwd1_y & have_fwd1_y, 0.5*(gy_bwd1 + gy_fwd1),
+             torch.where(have_bwd1_y, gy_bwd1,
+               torch.where(have_fwd1_y, gy_fwd1, torch.zeros_like(u))))
+    need_fb_y = (use_bwd_y & ~(have_bwd2_y | have_bwd1_y)) | ((~use_bwd_y) & ~(have_fwd2_y | have_fwd1_y))
+    gy = torch.where(need_fb_y, gy_fb, gy)
+
+    # x 轴
+    u_xm1, u_xm2, u_xp1, u_xp2 = neigh_x(u)
+    Ms_xm1, Ms_xm2, Ms_xp1, Ms_xp2 = neigh_x(Ms)
+    gx_bwd2 = (3*u - 4*u_xm1 + u_xm2)/(2*dx); gx_bwd1 = (u - u_xm1)/dx
+    gx_fwd2 = (-3*u + 4*u_xp1 - u_xp2)/(2*dx); gx_fwd1 = (u_xp1 - u)/dx
+    have_bwd2_x = (Ms_xm1>0.5) & (Ms_xm2>0.5)
+    have_bwd1_x = (Ms_xm1>0.5)
+    have_fwd2_x = (Ms_xp1>0.5) & (Ms_xp2>0.5)
+    have_fwd1_x = (Ms_xp1>0.5)
+    nx = nsurf[:,2:3]; use_bwd_x = (nx>=0)
+    gx = torch.zeros_like(u)
+    gx = torch.where(use_bwd_x & have_bwd2_x, gx_bwd2, gx)
+    gx = torch.where((~use_bwd_x) & have_fwd2_x, gx_fwd2, gx)
+    gx = torch.where(use_bwd_x & (~have_bwd2_x) & have_bwd1_x, gx_bwd1, gx)
+    gx = torch.where((~use_bwd_x) & (~have_fwd2_x) & have_fwd1_x, gx_fwd1, gx)
+    gx_fb = torch.where(have_bwd1_x & have_fwd1_x, 0.5*(gx_bwd1 + gx_fwd1),
+             torch.where(have_bwd1_x, gx_bwd1,
+               torch.where(have_fwd1_x, gx_fwd1, torch.zeros_like(u))))
+    need_fb_x = (use_bwd_x & ~(have_bwd2_x | have_bwd1_x)) | ((~use_bwd_x) & ~(have_fwd2_x | have_fwd1_x))
+    gx = torch.where(need_fb_x, gx_fb, gx)
+    return gz, gy, gx
+
+def pde_residual_time_balanced(theta_next, theta_curr, dtau, dxh_dyh_dzh, S):
+    dz, dy, dx = _unpack_deltas(dxh_dyh_dzh)
+    lap = laplacian_3d(theta_next, dz, dy, dx)
+    return (theta_next - theta_curr) - dtau.view(-1,1,1,1,1) * (lap + S)
+
+def bc_robin_residual_train_style(theta_next, Bi, nsurf, dxh_dyh_dzh, Ms):
+    dz, dy, dx = _unpack_deltas(dxh_dyh_dzh)
+    gz, gy, gx = one_sided_grad_on_interface_v2(theta_next, Ms, nsurf, dz, dy, dx)
+    nz = nsurf[:,0:1]; ny = nsurf[:,1:2]; nx = nsurf[:,2:3]
+    dth_dn = gz*nz + gy*ny + gx*nx
+    return -dth_dn - Bi*theta_next
+
+# ====== 数据 ======
+class HeatsinkH5:
+    def __init__(self, path):
+        self.f = h5py.File(path, 'r')
+        self.T = self.f['T_grid_shadow'][:]    # (Nt,Nz,Ny,Nx)
+        self.time = self.f['time'][:]          # (Nt,)
+        self.dt = self.f['time_dt'][:]         # (Nt-1,)
+        gp = self.f['grid_padded']
+        spacing = gp['spacing'][:]             # (dx,dy,dz)
+        dims = gp['dims'][:]                   # (Nz,Ny,Nx)
+        self.dx, self.dy, self.dz = float(spacing[0]), float(spacing[1]), float(spacing[2])
+        self.Nz, self.Ny, self.Nx = int(dims[0]), int(dims[1]), int(dims[2])
+        # 掩膜 & 边界
+        self.Ms = self.f['mask_solid'][:].astype(np.float32)
+        self.Mi = self.f['mask_interface'][:].astype(np.float32)
+        bc = self.f['bc/robin']
+        self.h_init = bc['h_init'][:].astype(np.float32)
+        self.T_inf  = bc['T_inf'][:].astype(np.float32)
+        self.nsurf  = self.f['normal_on_surface'][:]  # (3,Nz,Ny,Nx)
+        # 源
+        if 'sources' in self.f:
+            self.q_vol = self.f['sources/q_vol'][:].astype(np.float32)
+        else:
+            self.q_vol = np.zeros((self.Nz,self.Ny,self.Nx), np.float32)
+        # 常数 & 尺度
+        cst = self.f['const']
+        self.k = float(cst['k_solid'][()])
+        self.T_amb = float(cst['T_amb'][()])
+        self.rho = float(cst['rho_solid'][()])
+        self.cp  = float(cst['cp_solid'][()])
+        sc  = self.f['scales']
+        self.alpha  = float(sc['alpha'][()])
+        self.L      = float(sc['L'][()])
+        self.dTref  = float(sc['dT_ref'][()])
+        self.qref   = float(sc['q_ref'][()])
+        # 无量纲网格间距（顺序与训练一致：传 (dz,dy,dx)）
+        self.dx_hat = self.dx/self.L; self.dy_hat = self.dy/self.L; self.dz_hat = self.dz/self.L
+        self.Bi = (self.h_init*self.L/self.k).astype(np.float32)
+    def close(self):
+        try: self.f.close()
+        except: pass
+
+# ====== 模型（与训练一致） ======
+class SpectralConv3d(nn.Module):
+    def __init__(self, in_c, out_c, mz, my, mx):
+        super().__init__()
+        scale = 1/(in_c*out_c)
+        self.weight = nn.Parameter(scale*torch.randn(in_c, out_c, mz, my, mx, 2))
+        self.mz, self.my, self.mx = mz, my, mx
+    def compl_mul3d(self, a, w):
+        op = torch.einsum
+        return torch.stack([
+            op("bczyx,cozyx->bozyx", a[...,0], w[...,0]) - op("bczyx,cozyx->bozyx", a[...,1], w[...,1]),
+            op("bczyx,cozyx->bozyx", a[...,0], w[...,1]) + op("bczyx,cozyx->bozyx", a[...,1], w[...,0]),
+        ], dim=-1)
+    def forward(self, x):
+        B,C,Z,Y,X = x.shape
+        x_ft = torch.view_as_real(torch.fft.rfftn(x, s=(Z,Y,X), dim=(-3,-2,-1)))
+        out_ft = torch.zeros(B, self.weight.shape[1], Z, Y, X//2+1, 2, device=x.device, dtype=x.dtype)
+        mz,my,mx = min(self.mz,Z), min(self.my,Y), min(self.mx,X//2+1)
+        out_ft[:,:,:mz,:my,:mx,:] = self.compl_mul3d(x_ft[:,:,:mz,:my,:mx,:], self.weight[:,:,:mz,:my,:mx,:])
+        return torch.fft.irfftn(torch.view_as_complex(out_ft), s=(Z,Y,X), dim=(-3,-2,-1))
+
+class FNO3D(nn.Module):
+    def __init__(self, in_c=4, width=24, modes=(12,12,12), layers=4):
+        super().__init__()
+        self.lift = nn.Conv3d(in_c, width, 1)
+        self.specs = nn.ModuleList([SpectralConv3d(width, width, *modes) for _ in range(layers)])
+        self.ws    = nn.ModuleList([nn.Conv3d(width, width, 1) for _ in range(layers)])
+        self.proj  = nn.Sequential(nn.Conv3d(width, width, 1), nn.GELU(), nn.Conv3d(width, 1, 1))
+    def forward(self, x):
+        x = self.lift(x)
+        for sc, w in zip(self.specs, self.ws):
+            x = F.gelu(sc(x) + w(x))
+        return self.proj(x)  # (B,1,Nz,Ny,Nx)
+
+class HHead(nn.Module):
+    def __init__(self, in_c=9, width=16, layers=2):
+        super().__init__()
+        blocks=[]; c=in_c
+        for _ in range(layers):
+            blocks += [nn.Conv3d(c, width, 1), nn.GELU()]; c=width
+        blocks += [nn.Conv3d(c, 1, 1)]
+        self.net = nn.Sequential(*blocks)
+    def forward(self, feats): return self.net(feats)
+
+# ====== 评估 ======
+@torch.no_grad()
+def evaluate(args):
+    device = torch.device('cpu')
+
+    # --- 读数据
+    H = HeatsinkH5(args.data)
+    Nt,Nz,Ny,Nx = H.T.shape
+    Ms4 = torch.from_numpy(H.Ms[None,...]).float()
+    Mi4 = torch.from_numpy(H.Mi[None,...]).float()
+    S4  = torch.from_numpy((H.q_vol/H.qref)[None,...]).float()
+    nsurf = torch.from_numpy(H.nsurf).float()            # (3,Nz,Ny,Nx)
+    # 升到 5D 以便算残差
+    Ms5, Mi5, S5 = Ms4[:,None,...], Mi4[:,None,...], S4[:,None,...]       # (1,1,Nz,Ny,Nx)
+    nsurf5 = nsurf[None,...]                                              # (1,3,Nz,Ny,Nx)
+    dxh_dyh_dzh = torch.tensor([H.dz_hat,H.dy_hat,H.dx_hat], dtype=torch.float32)
+    L_over_k = torch.tensor([H.L/H.k], dtype=torch.float32)
+
+    # --- build model from ckpt (与训练一致：in_c=4)
+    ckpt = torch.load(args.ckpt, map_location='cpu')
+    a = ckpt["args"]
+    model = FNO3D(in_c=4, width=a["width"], modes=(a["mz"],a["my"],a["mx"]), layers=a["layers"]).to(device)
+    model.load_state_dict(ckpt["model"]); model.eval()
+    learn_h = ("hhead" in ckpt)
+    if learn_h:
+        hhead = HHead(in_c=9, width=a.get("h_width",16), layers=a.get("h_layers",2)).to(device)
+        hhead.load_state_dict(ckpt["hhead"]); hhead.eval()
+    else:
+        hhead = None
+
+    # --- 容器
+    per_pair = {"mse_theta": [], "mse_K": [], "mae_K": [], "relL2": [], "pde_rms": [], "bc_rms": []}
+    if args.rollout:
+        theta_roll = torch.zeros(Nt, Nz, Ny, Nx, dtype=torch.float32)
+
+    # 初值 θ(t0)
+    theta_t = torch.from_numpy((H.T[0]-H.T_amb)/H.dTref).float()
+    if args.rollout: theta_roll[0] = theta_t
+
+    for i in range(Nt-1):
+        theta_next_true = torch.from_numpy((H.T[i+1]-H.T_amb)/H.dTref).float()
+        dtau = torch.tensor([ H.dt[i]*H.alpha/(H.L*H.L) ], dtype=torch.float32)
+        dtau_field = torch.full_like(Ms4[0], float(dtau.item()))  # (Nz,Ny,Nx)
+
+        # ---- 前向（与训练一致：4通道输入 + 残差式推进）
+        x = torch.stack([theta_t, Ms4[0], S4[0], dtau_field], dim=0).unsqueeze(0)  # (1,4,Nz,Ny,Nx)
+        r = model(x)                  # (1,1,Nz,Ny,Nx)  预测 dθ/dτ
+        y_pred = theta_t + dtau.view(1,1,1).to(torch.float32) * r[0,0]  # (Nz,Ny,Nx)
+
+        # ---- 监督指标（固体）
+        Ms_cpu = Ms4[0]
+        diff_theta = (y_pred - theta_next_true)
+        mse_theta = (diff_theta**2 * Ms_cpu).sum().item() / (Ms_cpu.sum().item()+1e-8)
+        diff_K = diff_theta * H.dTref
+        mse_K = (diff_K**2 * Ms_cpu).sum().item() / (Ms_cpu.sum().item()+1e-8)
+        mae_K = (diff_K.abs() * Ms_cpu).sum().item() / (Ms_cpu.sum().item()+1e-8)
+        denom = (theta_next_true**2 * Ms_cpu).sum().sqrt().item() + 1e-8
+        relL2 = ( (diff_theta**2 * Ms_cpu).sum().sqrt().item() ) / denom
+        per_pair["mse_theta"].append(mse_theta)
+        per_pair["mse_K"].append(mse_K)
+        per_pair["mae_K"].append(mae_K)
+        per_pair["relL2"].append(relL2)
+
+        # ---- PDE 残差 RMS（固体, 与训练一致）
+        res_p = pde_residual_time_balanced(
+            y_pred[None,None,...], theta_t[None,None,...], dtau, dxh_dyh_dzh, S5
+        )
+        pde_rms = torch.sqrt( ((res_p**2)*Ms5).sum() / (Ms5.sum()+1e-8) ).item()
+        per_pair["pde_rms"].append(pde_rms)
+
+        # ---- BC 残差 RMS（界面, 与训练一致；Δh 只在界面）
+        if learn_h:
+            dtau5 = dtau.view(1,1,1,1,1).expand(1,1,Nz,Ny,Nx)  # (1,1,Nz,Ny,Nx)
+            feats = torch.cat([
+                y_pred[None,None,...],           # θ̂(t+Δt)
+                theta_t[None,None,...],          # θ(t)
+                S5, Mi5, Ms5,
+                nsurf5[:,0:1], nsurf5[:,1:2], nsurf5[:,2:3],
+                dtau5,                           # 第9通道：Δτ
+            ], dim=1)
+            delta_h_raw = hhead(feats)           # (1,1,Nz,Ny,Nx)
+            delta_h_raw = delta_h_raw * Mi5      # << 只在界面生效
+            h_init5 = torch.from_numpy(H.h_init[None,...]).float()[:,None,...]
+            h_eff = F.softplus(h_init5 + delta_h_raw) * Mi5 + h_init5*(1.0 - Mi5)
+            Bi_eff = h_eff * L_over_k.view(1,1,1,1,1)
+        else:
+            Bi_eff = torch.from_numpy(H.Bi[None,None,...]).float()
+
+        res_b = bc_robin_residual_train_style(
+            y_pred[None,None,...], Bi_eff, nsurf5, dxh_dyh_dzh, Ms5
+        )
+        bc_rms = torch.sqrt( ((res_b**2)*Mi5).sum() / (Mi5.sum()+1e-8) ).item()
+        per_pair["bc_rms"].append(bc_rms)
+
+        # ---- rollout
+        if args.rollout:
+            theta_roll[i+1] = y_pred.detach()
+
+        # 下一时刻
+        theta_t = y_pred.detach()
+
+    # ---- 汇总
+    summary = {k: {
+        "mean": float(np.mean(v)), "std": float(np.std(v)),
+        "p50": float(np.percentile(v,50)), "p90": float(np.percentile(v,90))
+    } for k,v in per_pair.items()}
+
+    # ---- 可选：准备导出 h 场（与训练一致地“界面生效”）
+    h_artifacts = None
+    if learn_h and args.save_h:
+        dtau_last = torch.tensor([ H.dt[-1]*H.alpha/(H.L*H.L) ], dtype=torch.float32)
+        dtau5 = dtau_last.view(1,1,1,1,1).expand(1,1,Nz,Ny,Nx)
+        feats = torch.cat([
+            theta_t[None,None,...],             # 用最后一步 θ̂
+            theta_t[None,None,...],             # 占位
+            S5, Mi5, Ms5,
+            nsurf5[:,0:1], nsurf5[:,1:2], nsurf5[:,2:3],
+            dtau5,
+        ], dim=1)
+        delta_h_raw = hhead(feats)
+        delta_h_raw = delta_h_raw * Mi5    # << 只在界面
+        h_init5 = torch.from_numpy(H.h_init[None,...]).float()[:,None,...]
+        h_eff = F.softplus(h_init5 + delta_h_raw) * Mi5 + h_init5*(1.0 - Mi5)
+
+        h_artifacts = {
+            "h_eff":               h_eff[0,0].cpu().numpy().astype(np.float32),
+            "delta_h_raw_masked":  (delta_h_raw[0,0].cpu().numpy().astype(np.float32)),
+            "Mi":                  (Mi5[0,0].cpu().numpy().astype(np.float32)),
+        }
+
+    # ---- 写新 H5
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    with h5py.File(args.out, "w") as fo:
+        g_m = fo.create_group("metrics")
+        for k, v in per_pair.items():
+            g_m.create_dataset(k, data=np.asarray(v, np.float64))
+        g_sum = fo.create_group("metrics_summary")
+        g_sum.attrs["summary_json"] = json.dumps(summary, ensure_ascii=False)
+
+        if h_artifacts is not None:
+            g_h = fo.create_group("h_learned")
+            for k, arr in h_artifacts.items():
+                g_h.create_dataset(k, data=arr)
+
+        if args.rollout:
+            fo.create_dataset("theta_rollout", data=theta_roll.numpy().astype(np.float32))
+            # 还原到 Kelvin：T̂ = θ̂*dTref + T_inf
+            Tinf = torch.from_numpy(H.T_inf).float()
+            T_roll = theta_roll.numpy().astype(np.float32) * H.dTref + Tinf[None,...].numpy().astype(np.float32)
+            fo.create_dataset("T_rollout", data=T_roll)
+
+        fo.attrs["src_h5"] = os.path.abspath(args.data)
+        fo.attrs["ckpt"]  = os.path.abspath(args.ckpt)
+        fo.attrs["note"]  = "Eval outputs aligned with training: 4ch input, residual stepping, time-balanced PDE, one-sided Robin, learned h masked on interface."
+
+    print("[ok] eval done. Summary:")
+    for k, s in summary.items():
+        print(f"  {k:10s}: mean={s['mean']:.4e}, p90={s['p90']:.4e}")
+
+    H.close()
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", type=str, required=True)
+    ap.add_argument("--ckpt", type=str, required=True)
+    ap.add_argument("--out",  type=str, required=True)
+    ap.add_argument("--rollout", action="store_true")
+    ap.add_argument("--save_h", action="store_true")
+    return ap.parse_args()
+
+if __name__ == "__main__":
+    args = parse_args()
+    evaluate(args)
