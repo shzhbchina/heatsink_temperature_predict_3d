@@ -1,20 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-eval_fno_h.py
-评估 FNO3D 主网络与（可选）HHead：
-- Teacher Forcing：每一步用真值推进；
-- Rollout：自回滚多步；
-- 写出新的 H5，包含预测温度/θ、可选 h 预测、以及度量指标。
+eval_fno_h (升级版) —— 适配最新训练模型：
+- Δθ 监督（模型输出 Δθ）
+- ctx = 9维全局 + log(dtau)
+- 频域 padding（reflect/replicate/none）
+- (A) 逐层 FiLM（layer-wise FiLM）
+- (C) 频域门控（AFNO 风格的可学习缩放）
+- UFNO（多分辨率 FNO，默认开启；自动从ckpt args读取）
 
 用法示例：
-python src/eval_heatsink_fno_pino_test5_mini.py \
-  --data dat/case_0001_L67_W73_Hb8_F8.h5 \
-  --ckpt model_param/heatsink_fno_pino_learnh/ckpt_ep410.pt \
-  --out model_param/eval/run1_eval.h5 \
+python src/eval_heatsink_fno_pino_test6.py \
+  --data dat_eval/case_0991_L324_W220_Hb17_F15.h5 \
+  --ckpt model_param/heatsink_fno_pino_learnh/ckpt_ep60.pt \
+  --out  model_param/eval/run1_eval.h5 \
   --mode both --copy_all \
   --rollout_from 0 --rollout_steps -1 \
-  --device cpu
-
+  --device cuda:0
 """
 
 import os, math, argparse
@@ -23,13 +24,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# =============== 调试器（需要时启用，不影响正常运行） ===============
 try:
     import pydevd_pycharm
-    pydevd_pycharm.settrace(host='host.docker.internal', port=5678,
-                            stdout_to_server=True, stderr_to_server=True, suspend=True)
+    if os.environ.get("PYCHARM_DEBUG","0") == "1":
+        pydevd_pycharm.settrace(host='host.docker.internal', port=5678,
+                                stdout_to_server=True, stderr_to_server=True, suspend=False)
 except Exception:
     pass
-
 
 # =================== 与训练保持一致的无量纲基准 ===================
 T_BASE = 298.0   # K
@@ -62,7 +64,7 @@ class HeatsinkH5:
         Nt, Nz, Ny, Nx = self.T.shape
         self.Nt, self.Nz, self.Ny, self.Nx = Nt, Nz, Ny, Nx
 
-        # 时间步长：优先用 time_dt，没有则用 diff(time)
+        # 时间步长
         if 'time_dt' in self.f:
             self.dt = self.f['time_dt'][:]  # (Nt-1,)
         else:
@@ -120,7 +122,7 @@ class HeatsinkH5:
             else:
                 raise ValueError("[data] alpha 缺失且无法由 k/(rho*cp) 推出。")
 
-        # 无量纲网格步长（按训练时的顺序）
+        # 无量纲网格步长（注意与训练保持一致的顺序）
         self.dx_hat = self.dx / self.L
         self.dy_hat = self.dy / self.L
         self.dz_hat = self.dz / self.L
@@ -155,14 +157,35 @@ class HeatsinkH5:
         try: self.f.close()
         except: pass
 
-# ------------------------- 模型（与训练保持一致） -------------------------
+# ------------------------- 频域padding助手（与训练一致） -------------------------
+def _fft_reflect_pad3d(x: torch.Tensor, padz: int, pady: int, padx: int, mode: str):
+    if mode == 'none' or (padz == 0 and pady == 0 and padx == 0):
+        return x, (0, 0, 0)
+    B, C, Z, Y, X = x.shape
+    pz = int(max(0, min(padz, max(Z - 1, 0))))
+    py = int(max(0, min(pady, max(Y - 1, 0))))
+    px = int(max(0, min(padx, max(X - 1, 0))))
+    if pz == 0 and py == 0 and px == 0:
+        return x, (0, 0, 0)
+    if mode not in ('reflect', 'replicate'):
+        raise ValueError(f"Unsupported pad mode for spectral conv: {mode}")
+    x_pad = F.pad(x, (px, px, py, py, pz, pz), mode=mode)
+    return x_pad, (pz, py, px)
+
+# ------------------------- 频域卷积（含频域门控） -------------------------
 class SpectralConv3d(nn.Module):
-    def __init__(self, in_c, out_c, modes_z, modes_y, modes_x):
+    def __init__(self, in_c, out_c, modes_z, modes_y, modes_x,
+                 pad_type: str = 'reflect', pad_z: int = 8, pad_y: int = 8, pad_x: int = 8):
         super().__init__()
         self.in_c = in_c; self.out_c = out_c
         self.mz, self.my, self.mx = modes_z, modes_y, modes_x
+        self.pad_type = pad_type
+        self.pad_z = int(pad_z); self.pad_y = int(pad_y); self.pad_x = int(pad_x)
+
         scale = 1 / (in_c * out_c)
         self.weight = nn.Parameter(scale * torch.randn(in_c, out_c, self.mz, self.my, self.mx, 2))
+        # 频域门控参数：y *= (1 + tanh(gate))
+        self.gate = nn.Parameter(torch.zeros(1, out_c, 1, 1, 1))
 
     def compl_mul3d(self, a, b):
         op = torch.einsum
@@ -172,37 +195,117 @@ class SpectralConv3d(nn.Module):
         ], dim=-1)
 
     def forward(self, x):
-        B, C, Z, Y, X = x.shape
-        x_ft = torch.view_as_real(torch.fft.rfftn(x, s=(Z, Y, X), dim=(-3, -2, -1)))
-        out_ft = torch.zeros(B, self.out_c, Z, Y, X // 2 + 1, 2, device=x.device, dtype=x.dtype)
-        mz, my, mx = min(self.mz, Z), min(self.my, Y), min(self.mx, X // 2 + 1)
+        x_pad, (pz, py, px) = _fft_reflect_pad3d(x, self.pad_z, self.pad_y, self.pad_x, self.pad_type)
+        B, C, Zp, Yp, Xp = x_pad.shape
+        x_ft = torch.view_as_real(torch.fft.rfftn(x_pad, s=(Zp, Yp, Xp), dim=(-3, -2, -1)))
+        out_ft = torch.zeros(B, self.out_c, Zp, Yp, Xp // 2 + 1, 2, device=x_pad.device, dtype=x_pad.dtype)
+
+        mz, my, mx = min(self.mz, Zp), min(self.my, Yp), min(self.mx, Xp // 2 + 1)
         w = self.weight[:, :, :mz, :my, :mx, :]
         out_ft[:, :, :mz, :my, :mx, :] = self.compl_mul3d(x_ft[:, :, :mz, :my, :mx, :], w)
-        return torch.fft.irfftn(torch.view_as_complex(out_ft), s=(Z, Y, X), dim=(-3, -2, -1))
 
+        y_pad = torch.fft.irfftn(torch.view_as_complex(out_ft), s=(Zp, Yp, Xp), dim=(-3, -2, -1))
+        y = y_pad[:, :, pz:Zp - pz, py:Yp - py, px:Xp - px] if (pz | py | px) > 0 else y_pad
+
+        scale = 1.0 + torch.tanh(self.gate)   # (1,out_c,1,1,1)
+        return y * scale
+
+# ------------------------- UFNO 多分辨率模块 -------------------------
+class UFNOBlock(nn.Module):
+    """
+    一个“层”的频域分支用多尺度：scale ∈ {1, down_factor, down_factor^2, ...}
+    每个尺度各自做 3D FFT + 频域卷积，再上采样回原分辨率并求和平均。
+    """
+    def __init__(self, width, modes, pad_cfg, num_scales=3, down_factor=2):
+        super().__init__()
+        mz, my, mx = modes
+        pad_type, pz, py, px = pad_cfg
+        self.num_scales = int(max(1, num_scales))
+        self.down_factor = int(max(1, down_factor))
+
+        self.spec_at_scale = nn.ModuleList()
+        for s in range(self.num_scales):
+            sf = (self.down_factor ** s)
+            mz_s = max(1, mz // sf)
+            my_s = max(1, my // sf)
+            mx_s = max(1, mx // sf)
+            self.spec_at_scale.append(
+                SpectralConv3d(width, width, mz_s, my_s, mx_s,
+                               pad_type=pad_type, pad_z=pz, pad_y=py, pad_x=px)
+            )
+
+    def forward(self, h):
+        B, C, Z, Y, X = h.shape
+        outs = []
+        for s, sc in enumerate(self.spec_at_scale):
+            if s == 0:
+                x_s = h
+            else:
+                f = self.down_factor ** s
+                x_s = F.avg_pool3d(h, kernel_size=f, stride=f, ceil_mode=False)
+            y_s = sc(x_s)
+            if s > 0:
+                y_s = F.interpolate(y_s, size=(Z, Y, X), mode='trilinear', align_corners=False)
+            outs.append(y_s)
+        # 简单平均（也可换 learnable 混合）
+        return sum(outs) / len(outs)
+
+# ------------------------- FNO3D 主干（FiLM + UFNO + LocalConv） -------------------------
 class FNO3D(nn.Module):
     def __init__(self, in_c=3, width=24, modes=(12,12,12), layers=4,
                  add_coords=True, fourier_k=8, use_local=True,
                  gn_groups=1, residual_scale=0.5, dropout=0.0,
-                 context_dim: int = 0):
+                 context_dim: int = 0,
+                 spec_pad_type: str = 'reflect', spec_pad=(8,8,8),
+                 # UFNO 相关
+                 ufno: bool = True, ufno_scales: int = 3, ufno_down_factor: int = 2):
         super().__init__()
         self.add_coords = add_coords
         self.fourier_k = fourier_k
         self.use_local = use_local
         self.context_dim = int(context_dim)
+        self.ufno = bool(ufno)
+        self.ufno_scales = int(max(1, ufno_scales))
+        self.ufno_down_factor = int(max(1, ufno_down_factor))
+        self.spec_pad_type = spec_pad_type
+        self.spec_pad = tuple(int(v) for v in spec_pad)
 
         extra_c = 0
-        if add_coords: extra_c = 3 + 6 * fourier_k
+        if add_coords:
+            extra_c = 3 + 6 * fourier_k
         self.lift = nn.Conv3d(in_c + extra_c, width, 1)
+
         mz, my, mx = modes
-        self.specs = nn.ModuleList([SpectralConv3d(width, width, mz, my, mx) for _ in range(layers)])
+        pz, py, px = self.spec_pad
+        pad_cfg = (self.spec_pad_type, pz, py, px)
+
+        # 频域层：UFNO on/off
+        self.specs = nn.ModuleList()
+        for _ in range(layers):
+            if self.ufno:
+                self.specs.append(UFNOBlock(width, (mz, my, mx), pad_cfg,
+                                            num_scales=self.ufno_scales,
+                                            down_factor=self.ufno_down_factor))
+            else:
+                self.specs.append(SpectralConv3d(width, width, mz, my, mx,
+                                                 pad_type=self.spec_pad_type, pad_z=pz, pad_y=py, pad_x=px))
+
+        # pointwise 分支 + local depthwise 3x3
         self.ws = nn.ModuleList([nn.Conv3d(width, width, 1) for _ in range(layers)])
         self.locals = nn.ModuleList([nn.Conv3d(width, width, 3, padding=1, groups=width) for _ in range(layers)]) if use_local else None
         self.norms = nn.ModuleList([nn.GroupNorm(gn_groups, width) for _ in range(layers)])
         self.gammas = nn.ParameterList([nn.Parameter(torch.tensor(float(residual_scale))) for _ in range(layers)])
         self.drop = nn.Dropout3d(dropout) if dropout > 0 else None
         self.proj = nn.Sequential(nn.Conv3d(width, width, 1), nn.GELU(), nn.Conv3d(width, 1, 1))
+
+        # (A) 逐层 FiLM（每层用 context 生成 (gamma, beta)）
         self.ctx_mlp = nn.Linear(self.context_dim, width) if self.context_dim > 0 else None
+        self.layer_films = nn.ModuleList()
+        if self.context_dim > 0:
+            for _ in range(layers):
+                lin = nn.Linear(self.context_dim, 2 * width)
+                nn.init.zeros_(lin.weight); nn.init.zeros_(lin.bias)  # 初始等效恒等
+                self.layer_films.append(lin)
 
     @staticmethod
     def _coords(Z, Y, X, device, dtype):
@@ -229,20 +332,34 @@ class FNO3D(nn.Module):
             pe = self._posenc(B, Z, Y, X, x.device, x.dtype)
             x = torch.cat([x, pe], dim=1)
         h = self.lift(x)
+
+        # 全局一次性 bias（与旧版兼容）
         if (self.ctx_mlp is not None) and (ctx is not None):
-            bias = self.ctx_mlp(ctx).view(B, -1, 1, 1, 1)
-            h = h + bias
+            h = h + self.ctx_mlp(ctx).view(B, -1, 1, 1, 1)
+
         for i, (sc, w, gn) in enumerate(zip(self.specs, self.ws, self.norms)):
-            y = sc(h) + w(h)
+            # 频域分支（UFNO 可能是多尺度平均）
+            y_spec = sc(h)
+            # 逐点 1x1
+            y_pw = w(h)
+            y = y_spec + y_pw
             if self.use_local:
                 y = y + self.locals[i](h)
             y = F.gelu(y)
             if self.drop is not None:
                 y = self.drop(y)
+
+            # 逐层 FiLM
+            if (ctx is not None) and (len(self.layer_films) > 0):
+                ab = self.layer_films[i](ctx)          # (B,2C)
+                gamma, beta = torch.chunk(ab, 2, dim=-1)
+                y = y * (1.0 + gamma.view(B, -1, 1, 1, 1)) + beta.view(B, -1, 1, 1, 1)
+
             h = h + self.gammas[i] * y
             h = gn(h)
         return self.proj(h)
 
+# ------------------------- HHead（与训练一致） -------------------------
 class HHead(nn.Module):
     def __init__(self, in_c=7, width=32, layers=2, out_feat=64, mlp_hidden=64,
                  mask_idx=2, h_min=0.0, h_max=30.0,
@@ -276,7 +393,7 @@ class HHead(nn.Module):
         with torch.no_grad():
             p = (h_prior - self.h_min) / max(1e-6, (self.h_max - self.h_min))
             p = float(np.clip(p, 1e-6, 1 - 1e-6))
-            b0 = math.log(p / (1 - p))
+            b0 = math.log(p / (1 - p))  # logit
             nn.init.constant_(self.mlp[-1].bias, b0)
             nn.init.zeros_(self.mlp[-1].weight)
 
@@ -300,12 +417,41 @@ class HHead(nn.Module):
 def load_ckpt_for_eval(ckpt_path, device='cpu'):
     ckpt = torch.load(ckpt_path, map_location=device)
     args = ckpt.get("args", {})
+
     width  = int(args.get("width", 24))
     layers = int(args.get("layers", 4))
-    mz     = int(args.get("mz", 12)); my = int(args.get("my", 12)); mx = int(args.get("mx", 12))
+    mz     = int(args.get("mz", 12))
+    my     = int(args.get("my", 12))
+    mx     = int(args.get("mx", 12))
     rk2    = bool(args.get("rk2", False))
-    # 模型
-    model = FNO3D(in_c=3, width=width, modes=(mz,my,mx), layers=layers, context_dim=10).to(device)
+
+    # 频域 padding 参数
+    spec_pad_type = str(args.get("spec_pad_type", "reflect"))
+    spz = int(args.get("spec_pad_z", 8)); spy = int(args.get("spec_pad_y", 8)); spx = int(args.get("spec_pad_x", 8))
+
+    # 其他结构参数（若训练没存也有默认）
+    add_coords   = bool(args.get("add_coords", True))
+    fourier_k    = int(args.get("fourier_k", 8))
+    use_local    = bool(args.get("use_local", True))
+    gn_groups    = int(args.get("gn_groups", 1))
+    residual_s   = float(args.get("residual_scale", 0.5))
+    dropout      = float(args.get("dropout", 0.0))
+
+    # UFNO 参数（默认开启；如旧 ckpt 无该键，仍能加载为默认开启）
+    ufno_enable      = bool(args.get("ufno_enable", args.get("ufno", True)))
+    ufno_scales      = int(args.get("ufno_scales", 3))
+    ufno_down_factor = int(args.get("ufno_down_factor", 2))
+
+    # 模型（context_dim=10：9维ctx_glb + 1维log(dtau)）
+    model = FNO3D(
+        in_c=3, width=width, modes=(mz,my,mx), layers=layers,
+        add_coords=add_coords, fourier_k=fourier_k, use_local=use_local,
+        gn_groups=gn_groups, residual_scale=residual_s, dropout=dropout,
+        context_dim=10,
+        spec_pad_type=spec_pad_type, spec_pad=(spz, spy, spx),
+        ufno=ufno_enable, ufno_scales=ufno_scales, ufno_down_factor=ufno_down_factor
+    ).to(device)
+
     missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
     if missing or unexpected:
         print(f"[warn] model state: missing={missing}, unexpected={unexpected}")
@@ -320,14 +466,14 @@ def load_ckpt_for_eval(ckpt_path, device='cpu'):
         if mh or uh:
             print(f"[warn] hhead state: missing={mh}, unexpected={uh}")
 
-    return model.eval(), hhead.eval() if hhead is not None else None, rk2, args
+    return model.eval(), (hhead.eval() if hhead is not None else None), rk2, args
 
-# ------------------------- 评估核心 -------------------------
+# ------------------------- 推进/评估 -------------------------
 @torch.inference_mode()
 def step_one(model, theta_t, Ms, S_nd, ctx_glb, dtau_scalar, rk2=False, device='cpu'):
     """
-    单步推进 θ：theta_{t+1} = theta_t + dtau * r(theta_t,...)
-    输入均为 torch.Tensor（B=1）
+    单步推进 θ（模型输出 Δθ）
+    theta_{t+1} = theta_t + Δθ
     """
     B, _, Z, Y, X = theta_t.shape
     x = torch.cat([theta_t, Ms, S_nd], dim=1)  # (B,3,Z,Y,X)
@@ -335,21 +481,20 @@ def step_one(model, theta_t, Ms, S_nd, ctx_glb, dtau_scalar, rk2=False, device='
     ctx = torch.cat([ctx_glb, torch.log(dtau + 1e-12)], dim=1)  # (B,10)
 
     if rk2:
-        r1 = model(x, ctx)
-        theta_tilde = theta_t + dtau.view(B,1,1,1,1) * r1
+        delta1 = model(x, ctx)
+        theta_tilde = theta_t + delta1
         x2 = torch.cat([theta_tilde, Ms, S_nd], dim=1)
-        r2 = model(x2, ctx)
-        r  = 0.5 * (r1 + r2)
+        delta2 = model(x2, ctx)
+        delta  = 0.5 * (delta1 + delta2)
     else:
-        r = model(x, ctx)
-    theta_next = theta_t + dtau.view(B,1,1,1,1) * r
+        delta = model(x, ctx)
+
+    theta_next = theta_t + delta
     return theta_next
 
 @torch.inference_mode()
 def predict_h_field(hhead, theta_t, Ms, Mi, nsurf, S_nd, ctx_glb, dtau_scalar, device='cpu'):
-    """
-    计算一步对应的 h 预测场（若 hhead 存在）
-    """
+    """计算一步对应的 h 预测场（若 hhead 存在）"""
     if hhead is None: return None
     B = theta_t.size(0)
     feats = torch.cat([
@@ -369,7 +514,7 @@ def _alloc_like(Nt, Nz, Ny, Nx, with_theta=False, with_h=False):
         out["theta_pred"] = np.zeros((Nt, Nz, Ny, Nx), np.float32)
     if with_h:
         out["h_pred"] = np.zeros((Nt, Nz, Ny, Nx), np.float32)
-        out["h_scalar"] = np.zeros((Nt,), np.float32)  # 若 hhead 输出为全局标量*mask，记录标量
+        out["h_scalar"] = np.zeros((Nt,), np.float32)
     return out
 
 def _metrics_T(T_pred, T_true, Ms):
@@ -392,7 +537,7 @@ def evaluate_modes(H: HeatsinkH5, model: FNO3D, hhead: HHead, rk2: bool,
                    device='cpu', do_teacher=True, do_rollout=True,
                    rollout_from=0, rollout_steps=-1):
     """
-    返回两个 dict（可能含空）：teacher, rollout
+    返回两个 dict（可能为空）：teacher, rollout
     dict 包含：T_pred, theta_pred(可选), h_pred(可选), h_scalar(可选), mae_T, rmse_T, (可选) mae_h, rmse_h
     """
     Nt, Nz, Ny, Nx = H.Nt, H.Nz, H.Ny, H.Nx
@@ -401,9 +546,8 @@ def evaluate_modes(H: HeatsinkH5, model: FNO3D, hhead: HHead, rk2: bool,
     S_nd = torch.from_numpy(H.S_nd[None, None, ...]).to(device)
     nsurf = torch.from_numpy(H.nsurf[None, ...]).to(device)      # (1,3,Z,Y,X)
     ctx_glb = torch.from_numpy(H.ctx_glb[None, :]).to(device)    # (1,9)
-    dxh_dyh_dzh = torch.tensor([H.dz_hat, H.dy_hat, H.dx_hat], dtype=torch.float32, device=device)  # 未在评估里直接用
 
-    # 预计算 dtau 序列
+    # 预计算 dtau 序列（仅用于 ctx 的 log(dtau)）
     dt = H.dt.astype(np.float64)
     dtau_arr = (dt * (H.alpha / (H.L * H.L))).astype(np.float64)  # (Nt-1,)
 
@@ -435,7 +579,6 @@ def evaluate_modes(H: HeatsinkH5, model: FNO3D, hhead: HHead, rk2: bool,
                 h_field = predict_h_field(hhead, theta_t, Ms, Mi, nsurf, S_nd, ctx_glb, dtau, device=device)
                 h_np = _to_numpy(h_field[0,0]).astype(np.float32)
                 out["h_pred"][t] = h_np
-                # 记录标量（若输出为全场常数*mask，取接口均值）
                 m = (H.Mi > 0.5)
                 out["h_scalar"][t] = float(h_np[m].mean()) if np.any(m) else 0.0
 
@@ -474,7 +617,6 @@ def evaluate_modes(H: HeatsinkH5, model: FNO3D, hhead: HHead, rk2: bool,
         for k in range(rollout_steps):
             t = start + k
             dtau = float(dtau_arr[t])
-            # 自回滚：用上一步预测作为输入
             theta_next = step_one(model, theta_curr, Ms, S_nd, ctx_glb, dtau, rk2=rk2, device=device)
             theta_next_np = _to_numpy(theta_next[0,0])
             T_next_np = theta_next_np * DT_BASE + T_BASE
@@ -544,7 +686,6 @@ def save_eval_h5(in_path, out_path, teacher_res, rollout_res, copy_all=False, me
             for k in ("T_pred", "theta_pred", "h_pred", "h_scalar", "mae_T", "rmse_T", "mae_h", "rmse_h"):
                 if k in rollout_res and rollout_res[k] is not None:
                     _write_group(gr, k, rollout_res[k])
-            # 额外写入起点与步数
             gr.attrs["rollout_from"] = int(rollout_res.get("rollout_from", 0))
             gr.attrs["rollout_steps"] = int(rollout_res.get("rollout_steps", 0))
     print(f"[OK] eval H5 written: {out_path}")
@@ -564,7 +705,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    device = torch.device(args.device if torch.cuda.is_available() or args.device=="cpu" else "cpu")
+    device = torch.device(args.device if (args.device.startswith("cuda") and torch.cuda.is_available()) or args.device=="cpu" else "cpu")
 
     # 数据与模型
     H = HeatsinkH5(args.data)
