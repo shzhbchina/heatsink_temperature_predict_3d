@@ -2,28 +2,29 @@
 
 ## eval
 for evaluation:
-### ckpt_120.pt
-trained parameters
-### heatsink_fno_model.py
-evaluation network
-### hs_input_conversion.py
-transform input (csv file) into h5 file, which is readable by heatsink_fno_model.py
-### pred_history.h5 
-file processed by hs_input_conversion.py
-### testcsv.csv
-raw input
+- ckpt_120.pt
+    - trained parameters
+- heatsink_fno_model.py
+    - evaluation network
+- hs_input_conversion.py
+    - transform input (csv file) into h5 file, which is readable by heatsink_fno_model.py
+- pred_history.h5 
+    - file processed by hs_input_conversion.py
+- testcsv.csv
+    - raw input
 
 ## model_param
-parameters, same with the one in eval/ckpt_120.pt
+- parameters, same with the one in eval/ckpt_120.pt
+
 
 ## src
-### eval_xxx.py
-evlation files used in training
-### train_xxx.py
-training files used in training
+- eval_xxx.py
+  - evaluation files used in training
+- train_xxx.py
+  - training files used in training
 
 
-## how to start
+## How to start
 In the CLI, run
 ```
 python hs_input_conversion.py
@@ -36,6 +37,11 @@ The .h5 T_history group attributes are [time, height, width, length]. The illust
 
 
 
+## Training dataset
+download the training dataset from modelscope
+```
+git clone https://oauth2:ms-f5acf27f-3d8a-4a9a-a08b-e264e5c51047@www.modelscope.cn/datasets/shzhbchina/heatsink_tempearture.git
+```
 
 ## Acknowledgements / Disclaimer
 Parts of the code in this repository were generated or optimized with the assistance of AI tools (e.g., ChatGPT, Gemini, Copilot). All AI-generated outputs have been verified and modified by the authors.
