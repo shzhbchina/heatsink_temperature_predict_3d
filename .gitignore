@@ -1,0 +1,19 @@
+#all
+*
+
+#except
+#src
+!src/
+!src/**
+
+#model param
+!model_param/
+!model_param/heatsink_fno_pino_learnh_4ls/
+!model_param/heatsink_fno_pino_learnh_4ls/ckpt_ep120.pt
+
+#eval
+!eval/
+!eval/**
+
+# gitignore
+!.gitignore
