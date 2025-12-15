@@ -1,6 +1,9 @@
 # heatsink_temperature_predict_3d
 
-## eval
+## 0. Introduction
+The files are open-source evaluation and training files for 3D heatsink temperature simulation. You are welcomed to use it.
+## 1. Files
+### eval
 for evaluation:
 - ckpt_120.pt
     - trained parameters
@@ -13,18 +16,18 @@ for evaluation:
 - testcsv.csv
     - raw input
 
-## model_param
+### model_param
 - parameters, same with the one in eval/ckpt_120.pt
 
 
-## src
+### src
 - eval_xxx.py
   - evaluation files used in training
 - train_xxx.py
   - training files used in training
 
 
-## How to start
+## 2. How to start
 In the CLI, run
 ```
 python hs_input_conversion.py
@@ -37,13 +40,13 @@ The .h5 T_history group attributes are [time, height, width, length]. The illust
 
 
 
-## Training dataset
+## 3. Training dataset
 download the training dataset from modelscope
 ```
 git clone https://oauth2:ms-f5acf27f-3d8a-4a9a-a08b-e264e5c51047@www.modelscope.cn/datasets/shzhbchina/heatsink_tempearture.git
 ```
 
-## Acknowledgements / Disclaimer
+## 4. Acknowledgements / Disclaimer
 Parts of the code in this repository were generated or optimized with the assistance of AI tools (e.g., ChatGPT, Gemini, Copilot). All AI-generated outputs have been verified and modified by the authors.
 
 
