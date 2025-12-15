@@ -15,5 +15,8 @@
 !eval/
 !eval/**
 
+# add readme
+!README.md
+
 # gitignore
 !.gitignore
