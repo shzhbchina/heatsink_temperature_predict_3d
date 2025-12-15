@@ -21,3 +21,18 @@ parameters, same with the one in eval/ckpt_120.pt
 evlation files used in training
 ### train_xxx.py
 training files used in training
+
+
+## how to start
+In the CLI, run
+```
+python hs_input_conversion.py
+```
+The file read testcsv.csv and calculates the predicted temperature in .h5 file.
+
+The .h5 T_history group attributes are [time, height, width, length]. The illustration is shown below.
+
+![h5_file_snapshot](./images/h5_file_snapshot.png)
+
+
+
