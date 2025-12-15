@@ -1,26 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-eval_heatsink_fno_pino_test7.py  (对齐 train_fno_pino_h_11_cuda.py)
-- Δθ 监督（模型输出 Δθ）
-- ctx = 9维全局 + log(dtau)
-- 频域 padding（reflect/replicate/none）
-- (A) 逐层 FiLM（layer-wise FiLM）
-- (C) 频域门控（SpectralConv3d: y *= 1+tanh(gate)）
-- UFNO：MultiResSpectral3DBlock（多分辨率谱卷积，softmax 融合；字段名与训练保持一致）
+eval_heatsink_fno_pino_twoframe.py
+在原 test7 基础上，新增 TwoFrame（跨时间两帧）评估：
+- 随机抽取 K 对 (ts, te)，或手工指定若干对，做一步跨越预测
+- 保存每对的输入 T(ts)、预测 T̂(te)、真值 T(te)、Δτ、指标等到输出 H5
 
-用法示例：
-'case_0992_L352_W88_Hb8_F10.h5''case_0991_L324_W220_Hb17_F15.h5'
-python src/eval_heatsink_fno_pino_test7.py \
+其余：teacher forcing / rollout 评估与原版保持一致。
+
+示例：
+
+# 1) 随机抽取 10 对跨步预测（其余 teacher/rollout 也可同时生成）
+python src/eval_heatsink_fno_pino_twoframe.py \
   --data dat_eval/case_0992_L352_W88_Hb8_F10.h5 \
-  --ckpt model_param/heatsink_fno_pino_learnh_8ls/ckpt_ep35.pt \
-  --out  model_param/eval/run1_eval_992_1.h5 \
+  --ckpt model_param/heatsink_fno_pino_h_8ls/ckpt_ep25.pt \
+  --out  model_param/eval/run_twoframe_random.h5 \
   --mode both --copy_all \
-  --rollout_from 0 --rollout_steps -1 \
-  --device cuda:0 \
-  --rk2
+  --twoframe-count 10 --twoframe-min-gap 1 --twoframe-max-gap -1 \
+  --device cuda:0 --rk2
+
+# 2) 手工指定三对 (0->10, 5->20, 12->40) 做跨步预测
+python src/eval_heatsink_fno_pino_test8.py \
+  --data dat_eval/case_0992_L352_W88_Hb8_F10.h5 \
+  --ckpt model_param/heatsink_fno_pino_learnh_8ls/ckpt_ep39.pt \
+  --out  model_param/eval/run1_eval_992_2.h5\
+  --mode rollout --copy_all \
+  --twoframe-pairs "0-8" \
+  --device cuda:0 --rk2
 """
 
-import os, math, argparse
+import os, math, argparse, random
 import h5py, numpy as np
 import torch
 import torch.nn as nn
@@ -33,7 +41,7 @@ DT_BASE = 30.0   # K
 try:
     import pydevd_pycharm
     pydevd_pycharm.settrace(host='host.docker.internal', port=5678,
-                            stdout_to_server=True, stderr_to_server=True, suspend=True)
+                            stdout_to_server=True, stderr_to_server=True, suspend=False)
 except Exception:
     pass
 
@@ -157,7 +165,7 @@ class HeatsinkH5:
         try: self.f.close()
         except: pass
 
-# ------------------------- 频域padding助手（与训练一致） -------------------------
+# ------------------------- 频域padding助手 -------------------------
 def _fft_reflect_pad3d(x: torch.Tensor, padz: int, pady: int, padx: int, mode: str):
     if mode == 'none' or (padz == 0 and pady == 0 and padx == 0):
         return x, (0, 0, 0)
@@ -182,9 +190,8 @@ class SpectralConv3d(nn.Module):
         self.pad_type = pad_type
         self.pad_z = int(pad_z); self.pad_y = int(pad_y); self.pad_x = int(pad_x)
 
-        scale = 1 / (in_c * out_c)
+        scale = 1 / max(1, in_c * out_c)
         self.weight = nn.Parameter(scale * torch.randn(in_c, out_c, self.mz, self.my, self.mx, 2))
-        # 频域门控：y *= (1 + tanh(gate))
         self.gate = nn.Parameter(torch.zeros(1, out_c, 1, 1, 1))
 
     def compl_mul3d(self, a, b):
@@ -207,17 +214,11 @@ class SpectralConv3d(nn.Module):
         y_pad = torch.fft.irfftn(torch.view_as_complex(out_ft), s=(Zp, Yp, Xp), dim=(-3, -2, -1))
         y = y_pad[:, :, pz:Zp - pz, py:Yp - py, px:Xp - px] if (pz | py | px) > 0 else y_pad
 
-        scale = 1.0 + torch.tanh(self.gate)   # (1,out_c,1,1,1)
+        scale = 1.0 + torch.tanh(self.gate)
         return y * scale
 
-# ------------------------- UFNO：多分辨率 3D 频域块（与训练端一致） -------------------------
+# ------------------------- UFNO：多分辨率 3D 频域块 -------------------------
 class MultiResSpectral3DBlock(nn.Module):
-    """
-    多分辨率 FNO：
-      - 下采样成多尺度（1×/2×/4× ...），各尺度用 SpectralConv3d
-      - 上采样回原分辨率后，用可学习 softmax 权重融合
-      字段：self.specs (ModuleList of SpectralConv3d), self.scale_logits (learnable)
-    """
     def __init__(self, width: int, modes: tuple, pad_type: str,
                  spec_pad: tuple, num_scales: int = 3,
                  pool_type: str = 'avg', up_mode: str = 'trilinear'):
@@ -265,7 +266,7 @@ class MultiResSpectral3DBlock(nn.Module):
             if s > 0:
                 y_s = self._up(y_s, (Z, Y, X))
             feats.append(y_s)
-        w = torch.softmax(self.scale_logits, dim=0)  # (S,)
+        w = torch.softmax(self.scale_logits, dim=0)
         y = 0.0
         for s in range(self.num_scales):
             y = y + w[s] * feats[s]
@@ -292,7 +293,6 @@ class FNO3D(nn.Module):
                  gn_groups=1, residual_scale=0.5, dropout=0.0,
                  context_dim: int = 0,
                  spec_pad_type: str = 'reflect', spec_pad=(8,8,8),
-                 # UFNO 相关（与训练一致）
                  ufno: bool = True, ufno_scales: int = 3,
                  ufno_pool: str = 'avg', ufno_upmode: str = 'trilinear'):
         super().__init__()
@@ -315,7 +315,6 @@ class FNO3D(nn.Module):
         mz, my, mx = modes
         pz, py, px = self.spec_pad
 
-        # 频域层：UFNO on/off
         self.specs = nn.ModuleList()
         for _ in range(layers):
             if self.ufno:
@@ -338,7 +337,6 @@ class FNO3D(nn.Module):
         self.drop = nn.Dropout3d(dropout) if dropout > 0 else None
         self.proj = nn.Sequential(nn.Conv3d(width, width, 1), nn.GELU(), nn.Conv3d(width, 1, 1))
 
-        # (A) 逐层 FiLM（每层用 context 生成 (gamma, beta)）
         self.ctx_mlp = nn.Linear(self.context_dim, width) if self.context_dim > 0 else None
         self.layer_films = nn.ModuleList()
         if self.context_dim > 0:
@@ -373,7 +371,6 @@ class FNO3D(nn.Module):
             x = torch.cat([x, pe], dim=1)
         h = self.lift(x)
 
-        # 全局一次性 bias（与旧版兼容）
         if (self.ctx_mlp is not None) and (ctx is not None):
             h = h + self.ctx_mlp(ctx).view(B, -1, 1, 1, 1)
 
@@ -384,7 +381,6 @@ class FNO3D(nn.Module):
             y = F.gelu(y)
             if self.drop is not None:
                 y = self.drop(y)
-            # 逐层 FiLM
             if (ctx is not None) and (len(self.layer_films) > 0):
                 ab = self.layer_films[i](ctx)
                 gamma, beta = torch.chunk(ab, 2, dim=-1)
@@ -433,19 +429,19 @@ class HHead(nn.Module):
 
     def forward(self, feats, ctx_vec=None):
         B, _, Z, Y, X = feats.shape
-        z = self.net(feats)                                     # (B,K,Z,Y,X)
-        mask = feats[:, self.mask_idx:self.mask_idx+1].float()  # (B,1,Z,Y,X)
+        z = self.net(feats)
+        mask = feats[:, self.mask_idx:self.mask_idx+1].float()
         denom = mask.sum(dim=(2, 3, 4), keepdim=True).clamp_min(1e-6)
-        g = (z * mask).sum(dim=(2, 3, 4), keepdim=True) / denom # (B,K,1,1,1)
-        g = g.flatten(1)                                        # (B,K)
-        raw = self.mlp(g)                                       # (B,1)
+        g = (z * mask).sum(dim=(2, 3, 4), keepdim=True) / denom
+        g = g.flatten(1)
+        raw = self.mlp(g)
         if self.use_ctx_film and (ctx_vec is not None):
-            ab = self.ctx2affine(ctx_vec)                       # (B,2)
+            ab = self.ctx2affine(ctx_vec)
             a = ab[:, :1]; b = ab[:, 1:2]
             raw = (1.0 + a) * raw + b
-        h_norm = torch.sigmoid(self.beta * raw)                 # (B,1)
+        h_norm = torch.sigmoid(self.beta * raw)
         h_scalar = self.h_min + (self.h_max - self.h_min) * h_norm
-        return h_scalar.view(B, 1, 1, 1, 1) * mask              # (B,1,Z,Y,X)
+        return h_scalar.view(B, 1, 1, 1, 1) * mask
 
 # ------------------------- ckpt I/O -------------------------
 def load_ckpt_for_eval(ckpt_path, device='cpu'):
@@ -459,11 +455,9 @@ def load_ckpt_for_eval(ckpt_path, device='cpu'):
     mx     = int(args.get("mx", 12))
     rk2    = bool(args.get("rk2", False))
 
-    # 频域 padding 参数
     spec_pad_type = str(args.get("spec_pad_type", "reflect"))
     spz = int(args.get("spec_pad_z", 8)); spy = int(args.get("spec_pad_y", 8)); spx = int(args.get("spec_pad_x", 8))
 
-    # 其他结构参数（若训练没存也有默认）
     add_coords   = bool(args.get("add_coords", True))
     fourier_k    = int(args.get("fourier_k", 8))
     use_local    = bool(args.get("use_local", True))
@@ -471,13 +465,11 @@ def load_ckpt_for_eval(ckpt_path, device='cpu'):
     residual_s   = float(args.get("residual_scale", 0.5))
     dropout      = float(args.get("dropout", 0.0))
 
-    # UFNO 参数（与训练端一致）
     ufno_enable  = bool(args.get("ufno_enable", args.get("ufno", True)))
     ufno_scales  = int(args.get("ufno_scales", 3))
     ufno_pool    = str(args.get("ufno_pool", "avg"))
     ufno_upmode  = str(args.get("ufno_upmode", "trilinear"))
 
-    # 模型（context_dim=10：9维ctx_glb + 1维log(dtau)）
     model = FNO3D(
         in_c=3, width=width, modes=(mz,my,mx), layers=layers,
         add_coords=add_coords, fourier_k=fourier_k, use_local=use_local,
@@ -492,7 +484,6 @@ def load_ckpt_for_eval(ckpt_path, device='cpu'):
     if missing or unexpected:
         print(f"[warn] model state: missing={missing}, unexpected={unexpected}")
 
-    # hhead（如存在）
     hhead = None
     if "hhead" in ckpt:
         h_width  = int(args.get("h_width", 16))
@@ -504,15 +495,11 @@ def load_ckpt_for_eval(ckpt_path, device='cpu'):
 
     return model.eval(), (hhead.eval() if hhead is not None else None), rk2, args
 
-# ------------------------- 推进/评估 -------------------------
+# ------------------------- 单步推进/预测 -------------------------
 @torch.inference_mode()
 def step_one(model, theta_t, Ms, S_nd, ctx_glb, dtau_scalar, rk2=False, device='cpu'):
-    """
-    单步推进 θ（模型输出 Δθ）
-    theta_{t+1} = theta_t + Δθ
-    """
     B, _, Z, Y, X = theta_t.shape
-    x = torch.cat([theta_t, Ms, S_nd], dim=1)  # (B,3,Z,Y,X)
+    x = torch.cat([theta_t, Ms, S_nd], dim=1)
     dtau = torch.tensor([dtau_scalar], dtype=torch.float32, device=device).view(B,1)
     ctx = torch.cat([ctx_glb, torch.log(dtau + 1e-12)], dim=1)  # (B,10)
 
@@ -533,15 +520,12 @@ def predict_h_field(hhead, theta_t, Ms, Mi, nsurf, S_nd, ctx_glb, dtau_scalar, d
     if hhead is None: return None
     B = theta_t.size(0)
     feats = torch.cat([
-        theta_t,         # (B,1,...)
-        S_nd,            # (B,1,...)
-        Mi,              # (B,1,...)
-        Ms,              # (B,1,...)
+        theta_t, S_nd, Mi, Ms,
         nsurf[:,0:1], nsurf[:,1:2], nsurf[:,2:3]
-    ], dim=1)           # (B,7,Z,Y,X)
+    ], dim=1)
     dtau = torch.tensor([dtau_scalar], dtype=torch.float32, device=device).view(B,1)
-    ctx = torch.cat([ctx_glb, torch.log(dtau + 1e-12)], dim=1)  # (B,10)
-    return hhead(feats, ctx_vec=ctx)  # (B,1,Z,Y,X)
+    ctx = torch.cat([ctx_glb, torch.log(dtau + 1e-12)], dim=1)
+    return hhead(feats, ctx_vec=ctx)
 
 def _alloc_like(Nt, Nz, Ny, Nx, with_theta=False, with_h=False):
     out = {"T_pred": np.zeros((Nt, Nz, Ny, Nx), np.float32)}
@@ -567,6 +551,7 @@ def _metrics_h(h_pred, h_true, Mi):
     rmse = float(np.sqrt(np.mean(diff*diff)))
     return mae, rmse
 
+# ------------------------- Teacher / Rollout -------------------------
 @torch.inference_mode()
 def evaluate_modes(H: HeatsinkH5, model: FNO3D, hhead: HHead, rk2: bool,
                    device='cpu', do_teacher=True, do_rollout=True,
@@ -578,9 +563,8 @@ def evaluate_modes(H: HeatsinkH5, model: FNO3D, hhead: HHead, rk2: bool,
     nsurf = torch.from_numpy(H.nsurf[None, ...]).to(device)      # (1,3,Z,Y,X)
     ctx_glb = torch.from_numpy(H.ctx_glb[None, :]).to(device)    # (1,9)
 
-    # 预计算 dtau 序列（仅用于 ctx 的 log(dtau)）
     dt = H.dt.astype(np.float64)
-    dtau_arr = (dt * (H.alpha / (H.L * H.L))).astype(np.float64)  # (Nt-1,)
+    dtau_arr = (dt * (H.alpha / (H.L * H.L))).astype(np.float64)
 
     results_teacher, results_rollout = {}, {}
 
@@ -624,7 +608,6 @@ def evaluate_modes(H: HeatsinkH5, model: FNO3D, hhead: HHead, rk2: bool,
 
     # ---------- Rollout ----------
     if do_rollout:
-        # 当传 -1 时，滚动到末尾；否则截断到合法范围
         if rollout_steps is None or int(rollout_steps) < 0:
             rollout_steps_eff = (Nt - 1) - int(rollout_from)
         else:
@@ -641,8 +624,7 @@ def evaluate_modes(H: HeatsinkH5, model: FNO3D, hhead: HHead, rk2: bool,
         out["theta_pred"][:start+1] = theta_true[:start+1].astype(np.float32)
         out["T_pred"][:start+1] = H.T[:start+1].astype(np.float32)
 
-        # 用真值作为起点
-        theta_curr = torch.from_numpy(theta_true[start:start+1]).to(device).unsqueeze(1)  # (1,1,...)
+        theta_curr = torch.from_numpy(theta_true[start:start+1]).to(device).unsqueeze(1)
 
         for k in range(rollout_steps_eff):
             t = start + k
@@ -665,7 +647,7 @@ def evaluate_modes(H: HeatsinkH5, model: FNO3D, hhead: HHead, rk2: bool,
             mae, rmse = _metrics_T(out["T_pred"][t+1], H.T[t+1], H.Ms)
             mae_T[t+1], rmse_T[t+1] = mae, rmse
 
-            theta_curr = theta_next  # 自回滚
+            theta_curr = theta_next
 
             if (hhead is not None) and (H.h_truth is not None):
                 mae_h[t], rmse_h[t] = _metrics_h(out["h_pred"][t], H.h_truth[t], H.Mi)
@@ -681,6 +663,105 @@ def evaluate_modes(H: HeatsinkH5, model: FNO3D, hhead: HHead, rk2: bool,
 
     return results_teacher, results_rollout
 
+# ------------------------- TwoFrame（跨时间两帧） -------------------------
+def _parse_pairs_string(pairs_str, Nt):
+    """解析形如 '0-10,5-20,12-40' 的字符串为 [(ts,te), ...] 并校验。"""
+    pairs = []
+    if not pairs_str: return pairs
+    items = [s.strip() for s in pairs_str.split(",") if s.strip()]
+    for it in items:
+        if "-" not in it:
+            raise ValueError(f"bad pair token: {it} (expect 'ts-te')")
+        a, b = it.split("-", 1)
+        ts = int(a.strip()); te = int(b.strip())
+        if not (0 <= ts < te <= Nt-1):
+            raise ValueError(f"pair out of range: ({ts},{te}), Nt={Nt}")
+        pairs.append((ts, te))
+    return pairs
+
+@torch.inference_mode()
+def evaluate_twoframe(H: HeatsinkH5, model: FNO3D, rk2: bool,
+                      device='cpu',
+                      count: int = 0,
+                      pairs_str: str = "",
+                      min_gap: int = 1,
+                      max_gap: int = -1,
+                      seed: int = 42):
+    """
+    生成若干跨时间两帧预测 (ts->te) 结果。
+    - 若 pairs_str 非空，则按给定对列表；否则随机抽取 count 对，间隔约束 [min_gap, max_gap]
+    - 返回 dict，写入 /eval/twoframe/ 下
+    """
+    Nt, Nz, Ny, Nx = H.Nt, H.Nz, H.Ny, H.Nx
+    Ms = torch.from_numpy(H.Ms[None, None, ...]).to(device)
+    S_nd = torch.from_numpy(H.S_nd[None, None, ...]).to(device)
+    ctx_glb = torch.from_numpy(H.ctx_glb[None, :]).to(device)
+
+    dtau_arr = (H.dt.astype(np.float64) * (H.alpha / (H.L * H.L))).astype(np.float64)  # (Nt-1,)
+
+    # 解析/采样时间对
+    pairs = _parse_pairs_string(pairs_str, Nt)
+    mode = "manual"
+    if not pairs:
+        mode = "random"
+        rng = random.Random(seed)
+        # gap 上限：-1 表示不限
+        if max_gap is None or max_gap < 0:
+            max_gap_eff = (Nt - 1)
+        else:
+            max_gap_eff = int(max_gap)
+        min_gap = max(1, int(min_gap))
+        # 随机采样 count 对
+        for _ in range(max(0, int(count))):
+            ts = rng.randint(0, Nt - 2)
+            gap_hi = min(max_gap_eff, (Nt - 1) - ts)
+            if gap_hi < min_gap:
+                # 若尾部不足以满足 min_gap，重新采样 ts
+                ts = rng.randint(0, Nt - 1 - min_gap)
+                gap_hi = min(max_gap_eff, (Nt - 1) - ts)
+            te = ts + rng.randint(min_gap, gap_hi)
+            pairs.append((ts, te))
+
+    K = len(pairs)
+    if K == 0:
+        return {}
+
+    # 预分配输出
+    out = {
+        "ts": np.zeros((K,), np.int32),
+        "te": np.zeros((K,), np.int32),
+        "dtau": np.zeros((K,), np.float32),
+        "T_in": np.zeros((K, Nz, Ny, Nx), np.float32),
+        "T_pred": np.zeros((K, Nz, Ny, Nx), np.float32),
+        "T_true": np.zeros((K, Nz, Ny, Nx), np.float32),
+        "mae_T": np.zeros((K,), np.float32),
+        "rmse_T": np.zeros((K,), np.float32),
+    }
+
+    theta_all = (H.T - T_BASE) / DT_BASE
+
+    for i, (ts, te) in enumerate(pairs):
+        dtau = float(dtau_arr[ts:te].sum())  # 注意：是 sum(ts ... te-1) 的 Δτ
+        theta_t = torch.from_numpy(theta_all[ts:ts+1]).to(device).unsqueeze(1)  # (1,1,Z,Y,X)
+        theta_pred = step_one(model, theta_t, Ms, S_nd, ctx_glb, dtau, rk2=rk2, device=device)
+
+        theta_pred_np = theta_pred[0,0].detach().cpu().numpy().astype(np.float32)
+        T_pred_np = (theta_pred_np * DT_BASE + T_BASE).astype(np.float32)
+
+        out["ts"][i] = ts
+        out["te"][i] = te
+        out["dtau"][i] = dtau
+        out["T_in"][i] = H.T[ts].astype(np.float32)
+        out["T_pred"][i] = T_pred_np
+        out["T_true"][i] = H.T[te].astype(np.float32)
+
+        mae, rmse = _metrics_T(out["T_pred"][i], out["T_true"][i], H.Ms)
+        out["mae_T"][i] = mae
+        out["rmse_T"][i] = rmse
+
+    out["_meta_mode"] = mode
+    return out
+
 # ------------------------- 写出 H5 -------------------------
 def _copy_all(src_h5: h5py.File, dst_h5: h5py.File):
     for name in src_h5.keys():
@@ -692,7 +773,8 @@ def _write_group(g, name, arr, comp=4):
     if name in g: del g[name]
     g.create_dataset(name, data=arr, compression="gzip", compression_opts=comp, shuffle=True)
 
-def save_eval_h5(in_path, out_path, teacher_res, rollout_res, copy_all=False, meta_note=""):
+def save_eval_h5(in_path, out_path, teacher_res, rollout_res, twoframe_res,
+                 copy_all=False, meta_note=""):
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     with h5py.File(in_path, "r") as fin, h5py.File(out_path, "w") as fo:
         fo.attrs["src_h5"] = os.path.abspath(in_path)
@@ -716,6 +798,14 @@ def save_eval_h5(in_path, out_path, teacher_res, rollout_res, copy_all=False, me
                     _write_group(gr, k, rollout_res[k])
             gr.attrs["rollout_from"] = int(rollout_res.get("rollout_from", 0))
             gr.attrs["rollout_steps"] = int(rollout_res.get("rollout_steps", 0))
+
+        # TwoFrame
+        if twoframe_res:
+            gf = ge.create_group("twoframe")
+            for k in ("ts","te","dtau","T_in","T_pred","T_true","mae_T","rmse_T"):
+                if k in twoframe_res and twoframe_res[k] is not None:
+                    _write_group(gf, k, twoframe_res[k])
+            gf.attrs["mode"] = str(twoframe_res.get("_meta_mode", ""))
     print(f"[OK] eval H5 written: {out_path}")
 
 # ------------------------- CLI -------------------------
@@ -729,7 +819,19 @@ def parse_args():
     ap.add_argument("--rollout_steps", type=int,default=-1, help="-1 表示滚到序列末尾")
     ap.add_argument("--device", type=str, default="cpu")
     ap.add_argument("--copy_all", action="store_true", help="复制原 H5 的全部内容，便于对照")
-    ap.add_argument("--rk2", action="store_true", help="use rk2")
+    ap.add_argument("--rk2", action="store_true", help="use rk2 (覆盖 ckpt 中的设置)")
+
+    # TwoFrame 新增参数
+    ap.add_argument("--twoframe-count", type=int, default=0,
+                    help="随机抽取的两帧对数量；=0 表示不做 TwoFrame 随机评估")
+    ap.add_argument("--twoframe-pairs", type=str, default="",
+                    help="手工指定若干对 ts-te，用逗号分隔；指定后忽略 twoframe-count")
+    ap.add_argument("--twoframe-min-gap", type=int, default=1,
+                    help="随机抽取时的最小间隔步数（>=1）")
+    ap.add_argument("--twoframe-max-gap", type=int, default=-1,
+                    help="随机抽取时的最大间隔步数；<0 表示不限")
+    ap.add_argument("--twoframe-seed", type=int, default=42,
+                    help="随机抽取的种子")
     return ap.parse_args()
 
 def main():
@@ -737,7 +839,8 @@ def main():
     device = torch.device(args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu")
 
     H = HeatsinkH5(args.data)
-    model, hhead, rk2, train_args = load_ckpt_for_eval(args.ckpt, device=device)
+    model, hhead, rk2_from_ckpt, train_args = load_ckpt_for_eval(args.ckpt, device=device)
+    rk2 = bool(args.rk2) or bool(rk2_from_ckpt)  # CLI 优先覆盖
     model.eval()
     if hhead is not None: hhead.eval()
 
@@ -750,8 +853,23 @@ def main():
         rollout_from=args.rollout_from, rollout_steps=args.rollout_steps
     )
 
-    meta_note = f"mode={args.mode}; rk2={rk2}; device={device}; ckpt={os.path.basename(args.ckpt)}"
-    save_eval_h5(H.path, args.out, teacher_res, rollout_res, copy_all=args.copy_all, meta_note=meta_note)
+    twoframe_res = {}
+    if (args.twoframe_pairs and args.twoframe_pairs.strip()) or (args.twoframe_count > 0):
+        print("[twoframe] generating cross-time predictions ...")
+        twoframe_res = evaluate_twoframe(
+            H, model, rk2, device=device,
+            count=args.twoframe_count,
+            pairs_str=args.twoframe_pairs,
+            min_gap=args.twoframe_min_gap,
+            max_gap=args.twoframe_max_gap,
+            seed=args.twoframe_seed
+        )
+
+    meta_note = (f"mode={args.mode}; rk2={rk2}; device={device}; "
+                 f"ckpt={os.path.basename(args.ckpt)}; twoframe_count={args.twoframe_count}; "
+                 f"twoframe_pairs={'manual' if args.twoframe_pairs else 'random'}")
+    save_eval_h5(H.path, args.out, teacher_res, rollout_res, twoframe_res,
+                 copy_all=args.copy_all, meta_note=meta_note)
     H.close()
 
 if __name__ == "__main__":

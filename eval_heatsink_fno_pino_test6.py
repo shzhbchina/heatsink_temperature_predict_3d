@@ -3,10 +3,10 @@
 eval_fno_h.py  (适配“Δθ监督 + ctx含log(dtau) + 频域padding”的新训练脚本)
 
 用法示例：
-"case_0002_L152_W59_Hb18_F6.h5"
+"case_0991_L324_W220_Hb17_F15.h5" case_0501_L349_W68_Hb11_F6.h5
 python src/eval_heatsink_fno_pino_test6.py \
-  --data dat_eval/case_0991_L324_W220_Hb17_F15.h5 \
-  --ckpt model_param/heatsink_fno_pino_learnh/ckpt_ep60.pt \
+  --data dat_eval/case_0501_L349_W68_Hb11_F6.h5 \
+  --ckpt model_param/heatsink_fno_pino_learnh/ckpt_ep70.pt \
   --out model_param/eval/run1_eval.h5 \
   --mode both --copy_all \
   --rollout_from 0 --rollout_steps -1 \
