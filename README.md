@@ -36,3 +36,9 @@ The .h5 T_history group attributes are [time, height, width, length]. The illust
 
 
 
+
+## Acknowledgements / Disclaimer
+Parts of the code in this repository were generated or optimized with the assistance of AI tools (e.g., ChatGPT, Gemini, Copilot). All AI-generated outputs have been verified and modified by the authors.
+
+
+
