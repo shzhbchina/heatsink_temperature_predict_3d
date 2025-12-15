@@ -5,8 +5,6 @@
 #src
 !src/
 !src/**
-src/h5_to_mysql.py
-src/h5_to_json_slicer_not_used.py
 
 #model param
 !model_param/
